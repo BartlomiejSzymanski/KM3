@@ -4,37 +4,7 @@ module Optimizers
 using ..SimpleAutoDiff
 using Statistics # For sqrt
 
-export SGD, Adam, RMSProp, update!
-
-# --- SGD Optimizer ---
-mutable struct SGD{T<:Real}
-    lr::T
-    params::Vector{<:SimpleAutoDiff.Variable{T}}
-    function SGD(lr::T, params::Vector{<:SimpleAutoDiff.Variable{T}}) where {T<:Real}
-        trainable_params = filter(p -> p.is_param, params)
-        if length(trainable_params) != length(params); @warn "SGD initialized with non-parameter Variables."; end
-        new{T}(lr, trainable_params)
-    end
-end
-
-function update!(opt::SGD{T}) where {T<:Real}
-    for p in opt.params
-        if p.gradient !== nothing
-            grad_val = grad(p)
-# --- START CHANGE (SGD Check) ---
-            # Check for non-finite values (NaN or Inf) correctly for scalars and arrays
-            is_non_finite = (isa(grad_val, Real) && !isfinite(grad_val)) ||
-                            (isa(grad_val, AbstractArray) && !all(isfinite, grad_val))
-            if is_non_finite
-                 @warn "SGD: Non-finite gradient detected for parameter shape $(size(p.value)). Skipping update."
-                 continue
-            end
-# --- END CHANGE (SGD Check) ---
-            p.value .-= opt.lr .* grad_val
-        end
-    end
-end
-
+export Adam, update!
 
 # --- Adam Optimizer ---
 mutable struct Adam{T<:Real}
