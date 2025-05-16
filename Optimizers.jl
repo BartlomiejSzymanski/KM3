@@ -1,12 +1,10 @@
-# Optimizer.jl
 module Optimizers
 
 using ..SimpleAutoDiff
-using Statistics # For sqrt
+using Statistics
 
-export Adam, update!
+export Adam, update!, RMSProp, clip_gradients!
 
-# --- Adam Optimizer ---
 mutable struct Adam{T<:Real}
     lr::T
     beta1::T
@@ -34,14 +32,12 @@ function update!(opt::Adam{T}) where {T<:Real}
     for p in opt.params
         if p.gradient !== nothing
             g = grad(p)
-# --- START CHANGE (Adam Check) ---
             is_non_finite = (isa(g, Real) && !isfinite(g)) ||
                             (isa(g, AbstractArray) && !all(isfinite, g))
             if is_non_finite
                  @warn "Adam: Non-finite gradient detected for parameter shape $(size(p.value)). Skipping update."
                  continue
             end
-# --- END CHANGE (Adam Check) ---
             opt.m[p] .= opt.beta1 .* opt.m[p] .+ (one(T) - opt.beta1) .* g
             opt.v[p] .= opt.beta2 .* opt.v[p] .+ (one(T) - opt.beta2) .* (g .^ 2)
             m_hat = opt.m[p] ./ bias_correction1
@@ -52,8 +48,6 @@ function update!(opt::Adam{T}) where {T<:Real}
     end
 end
 
-
-# --- RMSProp Optimizer ---
 mutable struct RMSProp{T<:Real}
     lr::T
     rho::T
@@ -74,17 +68,12 @@ function update!(opt::RMSProp{T}) where {T<:Real}
     for p in opt.params
         if haskey(opt.accumulators, p) && p.gradient !== nothing
             g = grad(p)
-# --- START CHANGE (RMSProp Check) ---
-            # ERROR WAS HERE: Trying to call isnan/isinf directly on array `g`
-            # if (isa(g, Real) && (isnan(g) || isinf(g))) || (isa(g, AbstractArray) && (any(isnan, g) || any(isinf, g)))
-            # Correct Check: Use isfinite for both scalars and arrays (via `all`)
             is_non_finite = (isa(g, Real) && !isfinite(g)) ||
                             (isa(g, AbstractArray) && !all(isfinite, g))
             if is_non_finite
                  @warn "RMSProp: Non-finite gradient detected for parameter shape $(size(p.value)). Skipping update."
                  continue
             end
-# --- END CHANGE (RMSProp Check) ---
             acc = opt.accumulators[p]
             acc .= opt.rho .* acc .+ (one(T) - opt.rho) .* (g .^ 2)
             update_step = (opt.lr ./ (sqrt.(acc) .+ opt.epsilon)) .* g
@@ -92,33 +81,26 @@ function update!(opt::RMSProp{T}) where {T<:Real}
         end
     end
 end
+
 function clip_gradients!(params::Vector{<:Variable}, threshold::Real)
     if threshold <= 0; error("Gradient clipping threshold must be positive."); end
-
-    # Calculate global L2 norm squared first (more numerically stable than summing norms)
-    # Use Float64 for accumulation to avoid overflow on large gradients
     global_norm_sq::Float64 = 0.0
     for p in params
         if p.is_param && p.gradient !== nothing
-            grad_val = p.gradient # Already the value (Matrix or Scalar)
-            global_norm_sq += sum(abs2, grad_val) # Sum of squares
+            grad_val = p.gradient
+            global_norm_sq += sum(abs2, grad_val)
         end
     end
     global_norm = sqrt(global_norm_sq)
-
-    # Calculate the clipping factor (if needed)
-    clip_coef = Float32(threshold) / (Float32(global_norm) + eps(Float32)) # Use target dtype, add epsilon
-
-    # Apply clipping only if the norm exceeds the threshold
+    clip_coef = Float32(threshold) / (Float32(global_norm) + eps(Float32))
     if clip_coef < 1.0
-        # println("Clipping Gradients: Norm = $global_norm, Coef = $clip_coef") # Debug print
         for p in params
             if p.is_param && p.gradient !== nothing
-                p.gradient .*= clip_coef # Scale gradient inplace
+                p.gradient .*= clip_coef
             end
         end
     end
-    return global_norm # Return the original norm (optional)
+    return global_norm
 end
 
-end # module Optimizers
+end
