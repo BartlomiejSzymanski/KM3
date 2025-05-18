@@ -1,7 +1,7 @@
 
 
 println("Including local modules...")
-include("AutoDiff.jl") # Defines Main.AutoDiff
+include("Autodiff.jl") # Defines Main.AutoDiff
 include("NeuralNet.jl")            # Defines Main.NeuralNet (uses Main.AutoDiff, Main.NeuralNet)
 include("LossFunctions.jl")
 include("Optimizers.jl")
@@ -18,61 +18,31 @@ println("Loading prepared dataset...")
 data_dir = joinpath(@__DIR__, "data") # @__DIR__ is MyCNNProject/
 prepared_data_path = joinpath(data_dir, "imdb_dataset_prepared.jld2")
 
-if !isfile(prepared_data_path)
-    println("Prepared data not found: $(prepared_data_path)")
-    println("Please run data_prep.jl manually first from the project root directory (MyCNNProject/):")
-    println("  julia --project data_prep.jl")
-    exit()
-end
 
 X_train_loaded = load(prepared_data_path, "X_train")
 y_train_loaded = load(prepared_data_path, "y_train")
 X_test_loaded = load(prepared_data_path, "X_test")
 y_test_loaded = load(prepared_data_path, "y_test")
-embeddings_matrix = load(prepared_data_path, "embeddings")
+embeddings = load(prepared_data_path, "embeddings")
 vocab = load(prepared_data_path, "vocab")
 
-embedding_dim = size(embeddings_matrix, 1)
+embedding_dim = size(embeddings, 1)
 vocab_size = length(vocab)
 max_len = size(X_train_loaded, 1)
 
-embeddings_for_layer = permutedims(embeddings_matrix, (2,1))
+embeddings_for_layer = permutedims(embeddings, (2,1))
 println("Dataset loaded. Vocab size: $vocab_size, Embedding dim: $embedding_dim, Max len: $max_len")
 
-cnn_embedding_dim = embedding_dim
-cnn_vocab_size = vocab_size
-cnn_kernel_width = 3
-cnn_out_channels = 8
-cnn_pool_size = 8
-cnn_dense_in_features = 16 * cnn_out_channels # 16 * 8 = 128
-cnn_dense_out_features = 1
+NeuralNet.load_embeddings!(NeuralNet.EmbeddingLayer(vocab_size, embedding_dim, pad_idx=findfirst(x->x=="<pad>", vocab)), embeddings_for_layer)
 
-padding_idx_val = findfirst(x->x=="<pad>", vocab)
-if padding_idx_val === nothing; error("<pad> token not found in vocab."); end
-
-embedding_layer = NeuralNet.EmbeddingLayer(cnn_vocab_size, cnn_embedding_dim, pad_idx=padding_idx_val)
-NeuralNet.load_embeddings!(embedding_layer, embeddings_for_layer)
-
-permute_to_conv_format = NeuralNet.PermuteLayer((2,3,1))
-
-conv_layer = NeuralNet.Conv1DLayer(cnn_kernel_width, cnn_embedding_dim, cnn_out_channels, NeuralNet.relu)
-
-maxpool_layer = NeuralNet.MaxPool1DLayer(cnn_pool_size, stride=cnn_pool_size)
-
-flatten_layer = NeuralNet.FlattenLayer()
-
-transpose_for_dense = NeuralNet.TransposeLayer()
-
-dense_layer = NeuralNet.Dense(cnn_dense_in_features, cnn_dense_out_features, NeuralNet.sigmoid)
-
-model = NeuralNet.MLPModel(
-    embedding_layer,
-    permute_to_conv_format,
-    conv_layer,
-    maxpool_layer,
-    flatten_layer,
-    transpose_for_dense,
-    dense_layer
+model = NeuralNet.Chain(
+    NeuralNet.EmbeddingLayer(vocab_size, embedding_dim, pad_idx=findfirst(x->x=="<pad>", vocab)),
+    NeuralNet.PermuteLayer((2,3,1)),
+    NeuralNet.Conv1DLayer(3, embedding_dim, 8, NeuralNet.relu),
+    NeuralNet.MaxPool1DLayer(8, stride=8),
+    NeuralNet.FlattenLayer(),
+    NeuralNet.TransposeLayer(),
+    NeuralNet.Dense(128, 1, NeuralNet.sigmoid)
 )
 
 println("Model created:")
@@ -88,78 +58,61 @@ num_samples_train = size(X_train_loaded, 2)
 num_batches = ceil(Int, num_samples_train / batch_size)
 
 println("\nStarting training...")
-NeuralNet.train_mode!(model)
+model.is_training_ref[] = true
 
 for epoch in 1:epochs
-    epoch_loss = 0.0
-    epoch_acc = 0.0
-    shuffled_indices = shuffle(1:num_samples_train)
-    t_epoch = @elapsed begin
-        for i in 1:num_batches
-            start_idx = (i-1) * batch_size + 1
-            end_idx = min(i * batch_size, num_samples_train)
-            current_batch_indices = shuffled_indices[start_idx:end_idx]
-            
-            X_batch_raw = X_train_loaded[:, current_batch_indices]
-            y_batch_raw = y_train_loaded[:, current_batch_indices]
-            X_batch_for_embedding = permutedims(X_batch_raw, (2,1))
-            y_true_for_loss = permutedims(convert(Matrix{Float32}, y_batch_raw), (2,1))
+    total_train_loss = 0.0
+    total_train_accuracy = 0.0
+    shuffled = shuffle(1:num_samples_train)
+
+    epoch_time = @elapsed begin
+        for batch_id in 1:num_batches
+            batch_start = (batch_id - 1) * batch_size + 1
+            batch_end = min(batch_id * batch_size, num_samples_train)
+            batch_indices = shuffled[batch_start:batch_end]
+
+            X_batch = permutedims(X_train_loaded[:, batch_indices], (2, 1))
+            y_batch = permutedims(convert(Matrix{Float32}, y_train_loaded[:, batch_indices]), (2, 1))
 
             AutoDiff.zero_grad!(model_params)
-            
-            x_input_var = AutoDiff.Variable(X_batch_for_embedding)
-            y_pred_var = model(x_input_var)
-            
-            loss_var = LossFunctions.binary_cross_entropy(y_pred_var, y_true_for_loss) # Renamed loss_val to loss_var
-            
-            AutoDiff.backward!(loss_var)
+
+            input_var = AutoDiff.Variable(X_batch)
+            prediction = model(input_var)
+
+            loss = LossFunctions.binary_cross_entropy(prediction, y_batch)
+            AutoDiff.backward!(loss)
             Optimizers.update!(optimizer)
-            
-            epoch_loss += AutoDiff.value(loss_var)
-            preds = AutoDiff.value(y_pred_var) .> 0.5f0
-            true_labels = y_true_for_loss .> 0.5f0
-            epoch_acc += Statistics.mean(preds .== true_labels)
-            
-            if i % 50 == 0 || i == num_batches
-                 @printf("  Epoch %d, Batch %d/%d: Avg Batch Loss: %.4f, Avg Batch Acc: %.4f\n",
-                        epoch, i, num_batches, epoch_loss/i, epoch_acc/i)
-            end
+
+            total_train_loss += AutoDiff.value(loss)
+
+            predicted_labels = AutoDiff.value(prediction) .> 0.5f0
+            correct_labels = y_batch .> 0.5f0
+            total_train_accuracy += Statistics.mean(predicted_labels .== correct_labels)
         end
     end
 
-    avg_epoch_loss = epoch_loss / num_batches
-    avg_epoch_acc = epoch_acc / num_batches
-    
-    NeuralNet.eval_mode!(model)
-    num_samples_test = size(X_test_loaded, 2)
-    X_test_for_embedding = permutedims(X_test_loaded, (2,1))
-    y_test_for_loss = permutedims(convert(Matrix{Float32}, y_test_loaded), (2,1))
+    avg_train_loss = total_train_loss / num_batches
+    avg_train_accuracy = total_train_accuracy / num_batches
 
-    x_test_input_var = AutoDiff.Variable(X_test_for_embedding)
-    y_test_pred_var = model(x_test_input_var)
-    
-    test_loss_var = LossFunctions.binary_cross_entropy(y_test_pred_var, y_test_for_loss) # Renamed test_loss_val
-    test_preds = AutoDiff.value(y_test_pred_var) .> 0.5f0
-    test_true_labels = y_test_for_loss .> 0.5f0
-    test_acc = Statistics.mean(test_preds .== test_true_labels)
-    
-    NeuralNet.train_mode!(model)
+    # --- Evaluation ---
+    model.is_training_ref[] = false
+    X_test_input = permutedims(X_test_loaded, (2, 1))
+    y_test = permutedims(convert(Matrix{Float32}, y_test_loaded), (2, 1))
+    test_input_var = AutoDiff.Variable(X_test_input)
+
+    test_prediction = model(test_input_var)
+    test_loss = LossFunctions.binary_cross_entropy(test_prediction, y_test)
+
+    test_pred_labels = AutoDiff.value(test_prediction) .> 0.5f0
+    test_true_labels = y_test .> 0.5f0
+    test_accuracy = Statistics.mean(test_pred_labels .== test_true_labels)
+    model.is_training_ref[] = true
 
     @printf("Epoch %d (%.2fs): Train Loss: %.4f, Train Acc: %.4f | Test Loss: %.4f, Test Acc: %.4f\n",
-            epoch, t_epoch, avg_epoch_loss, avg_epoch_acc, AutoDiff.value(test_loss_var), test_acc)
-    
-    if test_acc >= 0.80 && epoch >=2
+            epoch, epoch_time, avg_train_loss, avg_train_accuracy,
+            AutoDiff.value(test_loss), test_accuracy)
+
+    if test_accuracy ≥ 0.80 && epoch ≥ 2
         println("Target accuracy potentially achieved!")
     end
 end
-
-println("Training finished.")
-NeuralNet.eval_mode!(model)
-X_test_for_embedding_final = permutedims(X_test_loaded, (2,1))
-y_test_for_loss_final = permutedims(convert(Matrix{Float32}, y_test_loaded), (2,1))
-x_test_input_var_final = AutoDiff.Variable(X_test_for_embedding_final)
-y_test_pred_var_final = model(x_test_input_var_final)
-final_test_preds = AutoDiff.value(y_test_pred_var_final) .> 0.5f0
-final_test_true_labels = y_test_for_loss_final .> 0.5f0
-final_test_acc = Statistics.mean(final_test_preds .== final_test_true_labels)
-println("Final Test Accuracy: $(round(final_test_acc*100, digits=2))%")

@@ -114,7 +114,7 @@ function accumulate_gradient!(v::Variable{T}, g) where {T<:Real}
         end
         if is_large_param && rand() < 0.05
              init_grad_norm = v.gradient === nothing ? -1.0f0 : norm(v.gradient)
-             println("  [accumulate_gradient!] Initialized Large Param grad. Norm: $(round(init_grad_norm, sigdigits=4))")
+            #  println("  [accumulate_gradient!] Initialized Large Param grad. Norm: $(round(init_grad_norm, sigdigits=4))")
         end
     else
         try
@@ -184,34 +184,6 @@ function zero_grad!(params::AbstractVector{<:Variable})
         end
     end
 end
-
-
-function Base.getindex(v::Variable{T}, args...) where T
-    val = getindex(value(v), args...) # Perform slicing on the underlying value
-    original_shape = size(value(v))   # Store shape of the original tensor
-    indices = args                    # Capture the indices used
-
-    children = Variable[v] # This operation's output depends only on the original Variable 'v'
-    local new_var
-    function backward_fn()
-        slice_grad = grad(new_var)
-
-        if slice_grad !== nothing && !all(iszero, slice_grad) # Only proceed if there's a non-zero gradient
-            full_grad = zeros(T, original_shape)
-
-            try
-                view(full_grad, indices...) .= slice_grad
-            catch e
-                 @error "Error placing slice gradient back in getindex backward!" original_shape=original_shape indices=indices slice_grad_shape=size(slice_grad) exception=(e, catch_backtrace())
-                 return
-            end
-            accumulate_gradient!(v, full_grad) # Use accumulate_gradient! from the module scope
-        end
-    end
-    new_var = Variable(val, children, backward_fn)
-    return new_var
-end
-
 
 
 function Base.:+(a::Variable{T}, b::Variable{T}) where {T<:Real}
@@ -382,23 +354,6 @@ function Base.max(a::Variable{T}, val::Real) where {T<:Real}
 end
 Base.max(val::Real, a::Variable{T}) where T = max(a, val)
 
-function Base.tanh(a::Variable{T}) where {T<:Real}
-    val = tanh.(value(a))
-    children = Variable[a]
-    local new_var
-    function backward_fn()
-        output_grad = grad(new_var)
-        if output_grad !== nothing
-            tanh_squared = val .^ 2
-            local_grad = one(T) .- tanh_squared
-            grad_a_unshaped = output_grad .* local_grad
-            grad_a = sum_to(grad_a_unshaped, size(value(a)))
-            accumulate_gradient!(a, grad_a)
-        end
-    end
-    new_var = Variable(val, children, backward_fn)
-    return new_var
-end
 
 function sigmoid(x::Variable{T}; ϵ=1e-8) where T<:Real
      one_T = Variable(fill(T(1.0), size(value(x))), is_param=false)

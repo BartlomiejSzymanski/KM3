@@ -2,11 +2,10 @@ module NeuralNet
 using ..AutoDiff # Assumes it's findable via LOAD_PATH
 
 using Random, LinearAlgebra, Statistics, InteractiveUtils
-export Dense, EmbeddingLayer, MeanPoolLayer, DropoutLayer,
+export Dense, EmbeddingLayer,
        PermuteLayer, TransposeLayer, FlattenLayer, # New general layers
-       relu, sigmoid, sigmoid_val, tanh_approx, # Added sigmoid_val
-       MLPModel, forward, get_params, load_embeddings!,
-       train_mode!, eval_mode!,
+       relu, sigmoid, sigmoid_val, # Added sigmoid_val
+       Chain, forward, get_params, load_embeddings!,
        Conv1DLayer, MaxPool1DLayer, CNNModel, forward, get_params
 
 struct Conv1DLayer{T<:Real, F<:Function}
@@ -205,25 +204,6 @@ function get_params(model::CNNModel) # Rebuild params list each time or store in
     return unique(all_params)
 end
 
-function train_mode!(model::CNNModel)
-    model.is_training_ref[] = true
-    for layer_item in model.layers
-        if layer_item isa DropoutLayer # Check specific type
-            layer_item.is_training[] = true
-        end
-    end
-end
-function eval_mode!(model::CNNModel)
-    model.is_training_ref[] = false
-     for layer_item in model.layers
-        if layer_item isa DropoutLayer
-            layer_item.is_training[] = false
-        end
-    end
-end
-
-
-
 
 relu(x::Variable{T}) where T<:Real = AutoDiff.max(x, T(0.0)) # Use AD max
 
@@ -240,12 +220,6 @@ function sigmoid_val(v::T; epsilon=T(1e-8)) where T<:Real # Changed ϵ to epsilo
 end
 sigmoid_val(A::AbstractArray{T}; epsilon=T(1e-8)) where T<:Real = sigmoid_val.(A; epsilon=epsilon) # Changed ϵ to epsilon
 
-
-function tanh_approx(x::Variable{T}) where T<:Real
-    two = Variable(fill(T(2.0),size(value(x))),is_param=false)
-    one = Variable(fill(T(1.0),size(value(x))),is_param=false)
-    return two*sigmoid(two*x)-one
-end
 
 
 struct Dense{F<:Function}
@@ -330,40 +304,6 @@ function load_embeddings!(layer::EmbeddingLayer, embeddings_matrix::AbstractMatr
     println("Embeddings loaded into EmbeddingLayer.")
 end
 
-struct MeanPoolLayer; dims; MeanPoolLayer(dims)=new(dims); end
-function forward(layer::MeanPoolLayer, x::Variable) # Removed 'where T'
-    return Statistics.mean(x; dims=layer.dims)
-end
-get_params(layer::MeanPoolLayer)=[];
-
-mutable struct DropoutLayer{T<:Real}
-    p::T
-    is_training::Ref{Bool}
-    mask::Ref{Union{Nothing, AbstractArray{T}}}
-    function DropoutLayer(p::T; is_training_ref::Base.RefValue{Bool}=Ref(true)) where {T<:Real}
-        if !(0 <= p < 1); error("Dropout probability p must be in [0, 1)"); end
-        new{T}(p, is_training_ref, Ref{Union{Nothing, AbstractArray{T}}}(nothing))
-    end
-end
-function forward(layer::DropoutLayer{T}, x::Variable{T}) where {T<:Real}
-    if !layer.is_training[]; return x; end
-    val = value(x); p = layer.p;
-    mask_val = rand!(similar(val)) .> p;
-    layer.mask[] = convert(AbstractArray{T}, mask_val);
-    scale_factor = T(1.0 / (1.0 - p));
-    output_val = (val .* layer.mask[]) .* scale_factor;
-    children = Variable[x]; local new_var;
-    function backward_fn_dropout()
-        output_grad = grad(new_var);
-        if output_grad !== nothing && layer.mask[] !== nothing
-            input_grad = (output_grad .* layer.mask[]) .* scale_factor;
-            accumulate_gradient!(x, input_grad);
-        end
-    end
-    new_var = Variable(output_val, children, backward_fn_dropout);
-    return new_var;
-end
-get_params(layer::DropoutLayer) = []
 
 struct PermuteLayer
     dims_tuple::Tuple{Vararg{Int}} # Input permutation
@@ -460,10 +400,10 @@ function forward(layer::FlattenLayer, x::Variable)
 end
 get_params(layer::FlattenLayer) = []
 
-struct MLPModel
+struct Chain
     layers::Vector{Any}
     is_training_ref::Ref{Bool}
-    function MLPModel(layers_arg...)
+    function Chain(layers_arg...)
         model_layers = [l for l in layers_arg]
         is_training_ref = Ref(true)
         for layer_item in model_layers
@@ -474,12 +414,12 @@ struct MLPModel
         new(model_layers, is_training_ref)
     end
 end
-function forward(model::MLPModel, x_var::Variable)
+
+function forward(model::Chain, x_var::Variable)
     current_var = x_var
     for (i, layer_item) in enumerate(model.layers)
-
         if layer_item isa EmbeddingLayer && !(current_var.value isa AbstractMatrix{<:Integer})
-             error("Input to EmbeddingLayer must be Variable containing integer indices.")
+            error("Input to EmbeddingLayer must be Variable containing integer indices.")
         end
 
         if layer_item isa Main.Conv1DLayer
@@ -489,7 +429,7 @@ function forward(model::MLPModel, x_var::Variable)
                 error("Stopping due to missing Conv1DLayer forward method during dispatch check.")
             end
             current_var = Main.forward(layer_item, current_var)
-        elseif layer_item isa Main.MaxPool1DLayer # ADDED THIS BLOCK
+        elseif layer_item isa Main.MaxPool1DLayer
             arg_types = Tuple{typeof(layer_item), typeof(current_var)}
             if !hasmethod(Main.forward, arg_types)
                 InteractiveUtils.display(methods(Main.forward))
@@ -502,8 +442,10 @@ function forward(model::MLPModel, x_var::Variable)
     end
     return current_var
 end
-(model::MLPModel)(x_var::Variable) = forward(model, x_var)
-function get_params(model::MLPModel)
+
+(model::Chain)(x_var::Variable) = forward(model, x_var)
+
+function get_params(model::Chain)
     all_params = Variable[]
     for layer_item in model.layers
         if hasmethod(get_params, (typeof(layer_item),))
@@ -511,22 +453,6 @@ function get_params(model::MLPModel)
         end
     end
     return unique(all_params)
-end
-function train_mode!(model::MLPModel)
-    model.is_training_ref[] = true
-    for l_item in model.layers # changed l to l_item
-        if l_item isa DropoutLayer
-            l_item.is_training[] = true
-        end
-    end
-end
-function eval_mode!(model::MLPModel)
-    model.is_training_ref[] = false
-    for l_item in model.layers # changed l to l_item
-        if l_item isa DropoutLayer
-            l_item.is_training[] = false
-        end
-    end
 end
 
 end
