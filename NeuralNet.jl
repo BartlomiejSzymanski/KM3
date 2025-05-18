@@ -1,15 +1,16 @@
 module NeuralNet
+using ..SimpleAutoDiff # Assumes it's findable via LOAD_PATH
 
-using ..SimpleAutoDiff
-using Statistics, Random, LinearAlgebra, InteractiveUtils
-
-export Conv1DLayer, MaxPool1DLayer, CNNModel, forward, get_params,
-       Dense, EmbeddingLayer, FlattenLayer, MeanPoolLayer, DropoutLayer,
-       PermuteLayer, TransposeLayer, FlattenToFeaturesBatch,
-       relu, sigmoid, sigmoid_val, tanh_approx,
+using Random, LinearAlgebra, Statistics, InteractiveUtils
+# Export new layers as well
+export Dense, EmbeddingLayer, FlattenLayer, MeanPoolLayer, DropoutLayer,
+       PermuteLayer, TransposeLayer, FlattenToFeaturesBatch, # New general layers
+       relu, sigmoid, sigmoid_val, tanh_approx, # Added sigmoid_val
        MLPModel, forward, get_params, load_embeddings!,
-       train_mode!, eval_mode!
+       train_mode!, eval_mode!,
+       Conv1DLayer, MaxPool1DLayer, CNNModel, forward, get_params
 
+# --- Conv1D Layer ---
 struct Conv1DLayer{T<:Real, F<:Function}
     W::Variable{T}
     b::Variable{T}
@@ -28,12 +29,14 @@ struct Conv1DLayer{T<:Real, F<:Function}
     end
 end
 
+# MODIFIED SIGNATURE HERE
 function forward(layer::Conv1DLayer{T, F}, x_var::Variable{T}) where {T<:Real, F<:Function}
+    #println("--- INSIDE forward for Conv1DLayer ---") # DEBUG PRINT
     x = value(x_var)
     W_val = value(layer.W)
     b_val = value(layer.b)
     in_width, in_channels, batch_size = size(x)
-    kernel_w, _, out_channels = size(W_val)
+    kernel_w, _, out_channels = size(W_val) # Assuming W_val is (kernel_w, in_channels, out_channels)
     out_width = (in_width - kernel_w) ÷ layer.stride + 1
     out_val_raw = zeros(T, out_width, out_channels, batch_size)
 
@@ -41,8 +44,9 @@ function forward(layer::Conv1DLayer{T, F}, x_var::Variable{T}) where {T<:Real, F
         for c_out in 1:out_channels
             for w_out in 1:out_width
                 w_in_start = (w_out - 1) * layer.stride + 1
-                receptive_field = x[w_in_start : w_in_start + kernel_w - 1, :, b_idx]
-                kernel_slice = W_val[:, :, c_out]
+                # Ensure receptive field slicing is correct for W dimensions
+                receptive_field = x[w_in_start : w_in_start + kernel_w - 1, :, b_idx] # (kernel_w, in_channels)
+                kernel_slice = W_val[:, :, c_out] # (kernel_w, in_channels) for specific out_channel
                 out_val_raw[w_out, c_out, b_idx] = sum(receptive_field .* kernel_slice) + b_val[c_out]
             end
         end
@@ -53,8 +57,11 @@ function forward(layer::Conv1DLayer{T, F}, x_var::Variable{T}) where {T<:Real, F
     elseif layer.activation == sigmoid
         sigmoid_val.(out_val_raw)
     elseif layer.activation == identity
-        out_val_raw
+         out_val_raw
     else
+        # This case might be for other custom Function-like objects passed.
+        # If layer.activation is a struct or something not directly callable on array, this will fail.
+        # Assuming it's an element-wise function if not recognized explicitly.
         @warn "Conv1DLayer applying unknown activation $(typeof(layer.activation)) element-wise. Ensure this is intended."
         layer.activation.(out_val_raw)
     end
@@ -76,8 +83,9 @@ function forward(layer::Conv1DLayer{T, F}, x_var::Variable{T}) where {T<:Real, F
                 for w_out in 1:out_width
                     w_in_start = (w_out - 1) * layer.stride + 1
                     dL_db[c_out] += dL_dy_raw[w_out, c_out, b_idx_bw]
-                    receptive_field_bw = x[w_in_start : w_in_start + kernel_w - 1, :, b_idx_bw]
-                    kernel_slice_bw = W_val[:, :, c_out]
+                    receptive_field_bw = x[w_in_start : w_in_start + kernel_w - 1, :, b_idx_bw] # Renamed
+                    kernel_slice_bw = W_val[:, :, c_out] # Renamed
+
                     dL_dW[:, :, c_out] .+= receptive_field_bw .* dL_dy_raw[w_out, c_out, b_idx_bw]
                     dL_dx[w_in_start : w_in_start + kernel_w - 1, :, b_idx_bw] .+= kernel_slice_bw .* dL_dy_raw[w_out, c_out, b_idx_bw]
                 end
@@ -92,22 +100,26 @@ function forward(layer::Conv1DLayer{T, F}, x_var::Variable{T}) where {T<:Real, F
     return new_var
 end
 
+# Manual gradient calculation for common activations (applied to values)
 function activation_gradient_manual(dL_dy_activated, y_raw, activation_fn_original, T_type::Type)
     if activation_fn_original == relu
         return dL_dy_activated .* T_type.(y_raw .> 0)
-    elseif activation_fn_original == identity
+    elseif activation_fn_original == identity # Base.identity
         return dL_dy_activated
     elseif activation_fn_original == sigmoid
-        sig_y_raw_values = sigmoid_val.(y_raw)
-        return dL_dy_activated .* sig_y_raw_values .* (T_type(1) .- sig_y_raw_values)
+         sig_y_raw_values = sigmoid_val.(y_raw)
+         return dL_dy_activated .* sig_y_raw_values .* (T_type(1) .- sig_y_raw_values)
     else
         @warn "Trying to compute gradient for unknown activation $(typeof(activation_fn_original)) in activation_gradient_manual. Assuming derivative is 1 (like identity)."
-        return dL_dy_activated
+        # Fallback or error:
+        # error("Unsupported activation in Conv1D backward (activation_gradient_manual): $activation_fn_original")
+        return dL_dy_activated # Fallback: treat as identity if unknown (potentially wrong)
     end
 end
 
 get_params(layer::Conv1DLayer) = [layer.W, layer.b]
 
+# --- MaxPool1D Layer ---
 struct MaxPool1DLayer{T<:Real}
     pool_size::Int
     stride::Int
@@ -124,12 +136,12 @@ function forward(layer::MaxPool1DLayer{T}, x_var::Variable{T}) where T
     out_val = zeros(T, out_width, channels, batch_size)
     switches_val = Array{CartesianIndex{3}, 3}(undef, out_width, channels, batch_size)
 
-    for b_idx in 1:batch_size
+    for b_idx in 1:batch_size # Renamed b to b_idx
         for c in 1:channels
             for w_out in 1:out_width
                 w_in_start = (w_out - 1) * layer.stride + 1
                 w_in_end = w_in_start + layer.pool_size - 1
-                window_data = x[w_in_start:w_in_end, c, b_idx]
+                window_data = x[w_in_start:w_in_end, c, b_idx] # Renamed window to window_data
                 max_val, rel_idx = findmax(window_data)
                 out_val[w_out, c, b_idx] = max_val
                 switches_val[w_out, c, b_idx] = CartesianIndex(w_in_start + rel_idx[1] - 1, c, b_idx)
@@ -139,7 +151,7 @@ function forward(layer::MaxPool1DLayer{T}, x_var::Variable{T}) where T
     layer.switches[] = switches_val
     children = [x_var]
     local new_var
-    function backward_fn_maxpool()
+    function backward_fn_maxpool() # Renamed
         dL_dy = grad(new_var)
         if dL_dy === nothing; return; end
         dL_dx = zeros(T, size(x))
@@ -147,8 +159,8 @@ function forward(layer::MaxPool1DLayer{T}, x_var::Variable{T}) where T
         if size(dL_dy) != size(sw)
             @warn "MaxPool1D backward: dL_dy shape $(size(dL_dy)) mismatch with switches shape $(size(sw))"
             if length(dL_dy) == 1 && isa(dL_dy, Real)
-                dL_dy_scalar_val = dL_dy[]
-                for i_idx in eachindex(sw)
+                dL_dy_scalar_val = dL_dy[] # Renamed dL_dy_val
+                for i_idx in eachindex(sw) # Renamed i to i_idx
                     dL_dx[sw[i_idx]] += dL_dy_scalar_val
                 end
             else
@@ -166,37 +178,47 @@ function forward(layer::MaxPool1DLayer{T}, x_var::Variable{T}) where T
     new_var = Variable(out_val, children, backward_fn_maxpool)
     return new_var
 end
-
 get_params(layer::MaxPool1DLayer) = []
 
+# --- CNNModel ---
 struct CNNModel
     layers::Vector{Any}
-    parameters::Vector{Variable}
+    parameters::Vector{Variable} # Should be collected by get_params
     is_training_ref::Ref{Bool}
     function CNNModel(layers_arg...)
         model_layers = [l for l in layers_arg]
+        # params will be collected by get_params(model) later
+        # params = Variable[] # Not strictly needed to store here if get_params rebuilds it
         is_training_ref = Ref(true)
-        for layer_item in model_layers
+        for layer_item in model_layers # Renamed layer to layer_item
             if hasfield(typeof(layer_item), :is_training_ref) && hasfield(typeof(layer_item), :is_training)
-                if layer_item.is_training isa Ref{Bool}
+                 # This logic was for DropoutLayer specifically.
+                 # A DropoutLayer has `is_training::Ref{Bool}`.
+                 # The model's `is_training_ref` can be assigned to it.
+                 if layer_item.is_training isa Ref{Bool}
                     layer_item.is_training = is_training_ref
-                end
+                 end
             end
+            # if hasmethod(get_params, (typeof(layer_item),))
+            #     append!(params, get_params(layer_item))
+            # end
         end
-        new(model_layers, Variable[], is_training_ref)
+        # new(model_layers, unique(params), is_training_ref)
+        # Let get_params handle parameter collection dynamically
+        new(model_layers, Variable[], is_training_ref) # Initialize with empty params
     end
 end
 
 function forward(model::CNNModel, x_var::Variable)
     current_var = x_var
-    for layer_item in model.layers
+    for layer_item in model.layers # Renamed layer to layer_item
         current_var = forward(layer_item, current_var)
     end
     return current_var
 end
 (model::CNNModel)(x_var::Variable) = forward(model, x_var)
 
-function get_params(model::CNNModel)
+function get_params(model::CNNModel) # Rebuild params list each time or store in constructor
     all_params = Variable[]
     for layer_item in model.layers
         if hasmethod(get_params, (typeof(layer_item),))
@@ -209,24 +231,27 @@ end
 function train_mode!(model::CNNModel)
     model.is_training_ref[] = true
     for layer_item in model.layers
-        if layer_item isa DropoutLayer
+        if layer_item isa DropoutLayer # Check specific type
             layer_item.is_training[] = true
         end
     end
 end
-
 function eval_mode!(model::CNNModel)
     model.is_training_ref[] = false
-    for layer_item in model.layers
+     for layer_item in model.layers
         if layer_item isa DropoutLayer
             layer_item.is_training[] = false
         end
     end
 end
 
-relu(x::Variable{T}) where T<:Real = SimpleAutoDiff.max(x, T(0.0))
 
-function sigmoid(x::Variable{T}; epsilon=1e-8) where T<:Real
+
+
+# --- Activation Functions ---
+relu(x::Variable{T}) where T<:Real = SimpleAutoDiff.max(x, T(0.0)) # Use AD max
+
+function sigmoid(x::Variable{T}; epsilon=1e-8) where T<:Real # Changed ϵ to epsilon
     one_val = ones(T, size(value(x)))
     one_var = Variable(one_val, is_param=false)
     exp_neg_x = exp(-x)
@@ -234,10 +259,11 @@ function sigmoid(x::Variable{T}; epsilon=1e-8) where T<:Real
     return one_var / denominator
 end
 
-function sigmoid_val(v::T; epsilon=T(1e-8)) where T<:Real
+function sigmoid_val(v::T; epsilon=T(1e-8)) where T<:Real # Changed ϵ to epsilon
     return T(1) / (T(1) + exp(-v + epsilon))
 end
-sigmoid_val(A::AbstractArray{T}; epsilon=T(1e-8)) where T<:Real = sigmoid_val.(A; epsilon=epsilon)
+sigmoid_val(A::AbstractArray{T}; epsilon=T(1e-8)) where T<:Real = sigmoid_val.(A; epsilon=epsilon) # Changed ϵ to epsilon
+
 
 function tanh_approx(x::Variable{T}) where T<:Real
     two = Variable(fill(T(2.0),size(value(x))),is_param=false)
@@ -245,6 +271,8 @@ function tanh_approx(x::Variable{T}) where T<:Real
     return two*sigmoid(two*x)-one
 end
 
+
+# --- Dense Layer ---
 struct Dense{F<:Function}
     W::Variable
     b::Variable
@@ -265,6 +293,8 @@ function forward(layer::Dense, x::Variable)
 end
 get_params(layer::Dense) = [layer.W, layer.b]
 
+
+# --- Embedding Layer ---
 struct EmbeddingLayer
     weight::Variable
     vocab_size::Int
@@ -317,7 +347,6 @@ function forward(layer::EmbeddingLayer, x_indices_var::Variable{<:Integer})
     return new_var
 end
 get_params(layer::EmbeddingLayer) = [layer.weight]
-
 function load_embeddings!(layer::EmbeddingLayer, embeddings_matrix::AbstractMatrix)
     expected_size = (layer.vocab_size, layer.embedding_dim)
     if size(embeddings_matrix) != expected_size
@@ -327,6 +356,7 @@ function load_embeddings!(layer::EmbeddingLayer, embeddings_matrix::AbstractMatr
     println("Embeddings loaded into EmbeddingLayer.")
 end
 
+# --- Flatten Layer ---
 struct FlattenLayer
     input_shape_ref::Ref{Tuple}
     FlattenLayer() = new(Ref{Tuple}(()))
@@ -352,12 +382,14 @@ function forward(layer::FlattenLayer, x::Variable)
 end
 get_params(layer::FlattenLayer) = []
 
+# --- MeanPoolLayer ---
 struct MeanPoolLayer; dims; MeanPoolLayer(dims)=new(dims); end
-function forward(layer::MeanPoolLayer, x::Variable)
+function forward(layer::MeanPoolLayer, x::Variable) # Removed 'where T'
     return Statistics.mean(x; dims=layer.dims)
 end
-get_params(layer::MeanPoolLayer)=[]
+get_params(layer::MeanPoolLayer)=[];
 
+# --- Dropout Layer ---
 mutable struct DropoutLayer{T<:Real}
     p::T
     is_training::Ref{Bool}
@@ -369,51 +401,78 @@ mutable struct DropoutLayer{T<:Real}
 end
 function forward(layer::DropoutLayer{T}, x::Variable{T}) where {T<:Real}
     if !layer.is_training[]; return x; end
-    val = value(x); p = layer.p
-    mask_val = rand!(similar(val)) .> p
-    layer.mask[] = convert(AbstractArray{T}, mask_val)
-    scale_factor = T(1.0 / (1.0 - p))
-    output_val = (val .* layer.mask[]) .* scale_factor
-    children = Variable[x]
-    local new_var
+    val = value(x); p = layer.p;
+    mask_val = rand!(similar(val)) .> p;
+    layer.mask[] = convert(AbstractArray{T}, mask_val);
+    scale_factor = T(1.0 / (1.0 - p));
+    output_val = (val .* layer.mask[]) .* scale_factor;
+    children = Variable[x]; local new_var;
     function backward_fn_dropout()
-        output_grad = grad(new_var)
+        output_grad = grad(new_var);
         if output_grad !== nothing && layer.mask[] !== nothing
-            input_grad = (output_grad .* layer.mask[]) .* scale_factor
-            accumulate_gradient!(x, input_grad)
+            input_grad = (output_grad .* layer.mask[]) .* scale_factor;
+            accumulate_gradient!(x, input_grad);
         end
     end
-    new_var = Variable(output_val, children, backward_fn_dropout)
-    return new_var
+    new_var = Variable(output_val, children, backward_fn_dropout);
+    return new_var;
 end
 get_params(layer::DropoutLayer) = []
 
+# --- PermuteLayer ---
 struct PermuteLayer
-    dims_tuple::Tuple{Vararg{Int}}
-    inv_dims_tuple::Tuple{Vararg{Int}}
+    dims_tuple::Tuple{Vararg{Int}} # Input permutation
+    inv_dims_tuple::Tuple{Vararg{Int}} # Store the inverse permutation directly, not as a Ref
+
     function PermuteLayer(dims::Tuple{Vararg{Int}})
+        if isempty(dims)
+            error("Permutation dimensions cannot be empty.")
+        end
+        # Validate dims (e.g., ensure it's a permutation of 1:length(dims))
         n = length(dims)
         if sort(collect(dims)) != 1:n
             error("Permutation dimensions $dims must be a permutation of 1:$n.")
         end
+
         inv_dims_val_vec = Vector{Int}(undef, n)
         for (i, d_val) in enumerate(dims)
             inv_dims_val_vec[d_val] = i
         end
         inv_dims_actual_tuple = Tuple(inv_dims_val_vec)
+        
+        # new takes arguments in the order of fields
         new(dims, inv_dims_actual_tuple)
     end
 end
-PermuteLayer(dims::Int...) = PermuteLayer(dims)
+
+# Convenience constructor: dims... collects arguments into a tuple
+PermuteLayer(dims::Int...) = PermuteLayer(dims) # 'dims' here is already a tuple
+
 function forward(layer::PermuteLayer, x::Variable)
     x_val = value(x)
+    # Ensure the permutation length matches the number of dimensions to permute
+    # typically ndims(x_val) if permuting all, or a subset if that's the design.
+    # For now, assume layer.dims_tuple is for permuting ndims(x_val) dimensions.
+    if length(layer.dims_tuple) != ndims(x_val) && ndims(x_val) > 1 # Allow scalar pass-through if ndims=0 or 1
+        # This check depends on how you intend PermuteLayer to be used.
+        # Flux.permutedims(x, (2,1,3)) permutes the first 3 dims.
+        # Let's assume the tuple must match ndims for now.
+        if ndims(x_val) > 0 # Don't error on scalars which have ndims 0
+             @warn "PermuteLayer: length of dims_tuple ($(length(layer.dims_tuple))) does not match ndims of input ($(ndims(x_val))). Behavior might be unexpected."
+        end
+        # If it's a scalar or 1D array and dims_tuple is (1,), it's fine.
+        # If dims_tuple is longer than ndims(x_val), permutedims will error.
+        # If shorter, it permutes the first length(dims_tuple) dimensions.
+    end
+
     output_val = permutedims(x_val, layer.dims_tuple)
+    
     children = [x]
     local new_var
     function backward_fn_permute()
         grad_output = grad(new_var)
         if grad_output !== nothing
-            grad_input = permutedims(grad_output, layer.inv_dims_tuple)
+            grad_input = permutedims(grad_output, layer.inv_dims_tuple) # Use stored inv_dims_tuple
             accumulate_gradient!(x, grad_input)
         end
     end
@@ -422,9 +481,13 @@ function forward(layer::PermuteLayer, x::Variable)
 end
 get_params(layer::PermuteLayer) = []
 
+# --- TransposeLayer ---
 struct TransposeLayer end
 function forward(layer::TransposeLayer, x::Variable)
     x_val = value(x)
+    if ndims(x_val) != 2
+        error("TransposeLayer expects a 2D input Variable. Got $(ndims(x_val))D.")
+    end
     output_val = permutedims(x_val, (2,1))
     children = [x]
     local new_var
@@ -440,6 +503,7 @@ function forward(layer::TransposeLayer, x::Variable)
 end
 get_params(layer::TransposeLayer) = []
 
+# --- FlattenToFeaturesBatch Layer ---
 struct FlattenToFeaturesBatch
     input_shape_ref::Ref{Tuple}
     FlattenToFeaturesBatch() = new(Ref{Tuple}(()))
@@ -465,6 +529,7 @@ function forward(layer::FlattenToFeaturesBatch, x::Variable)
 end
 get_params(layer::FlattenToFeaturesBatch) = []
 
+# --- MLPModel (Chain Abstraction) ---
 struct MLPModel
     layers::Vector{Any}
     is_training_ref::Ref{Bool}
@@ -481,22 +546,44 @@ struct MLPModel
 end
 function forward(model::MLPModel, x_var::Variable)
     current_var = x_var
-    for layer_item in model.layers
+    #println("\n--- MLPModel Forward Pass ---")
+    for (i, layer_item) in enumerate(model.layers)
+        #println("Layer $i: $(layer_item) (Type=$(typeof(layer_item))), Input Var Type=$(typeof(current_var))")
+
         if layer_item isa EmbeddingLayer && !(current_var.value isa AbstractMatrix{<:Integer})
-            error("Input to EmbeddingLayer must be Variable containing integer indices.")
+             error("Input to EmbeddingLayer must be Variable containing integer indices.")
         end
-        if layer_item isa Main.NeuralNet.Conv1DLayer
-            current_var = Main.NeuralNet.forward(layer_item, current_var)
-        elseif layer_item isa Main.NeuralNet.MaxPool1DLayer
-            current_var = Main.NeuralNet.forward(layer_item, current_var)
+
+        # Explicitly check for and call forward methods from Main.CNNLayers
+        if layer_item isa Main.Conv1DLayer
+            #println("Dispatching to Main.forward for Conv1DLayer")
+            arg_types = Tuple{typeof(layer_item), typeof(current_var)}
+            if !hasmethod(Main.forward, arg_types)
+                #println("FAILURE: Method Main.forward NOT found for Conv1DLayer with types: $arg_types")
+                InteractiveUtils.display(methods(Main.forward))
+                error("Stopping due to missing Conv1DLayer forward method during dispatch check.")
+            end
+            current_var = Main.forward(layer_item, current_var)
+        elseif layer_item isa Main.MaxPool1DLayer # ADDED THIS BLOCK
+            #println("Dispatching to Main.forward for MaxPool1DLayer")
+            arg_types = Tuple{typeof(layer_item), typeof(current_var)}
+            if !hasmethod(Main.forward, arg_types)
+                #println("FAILURE: Method Main.forward NOT found for MaxPool1DLayer with types: $arg_types")
+                InteractiveUtils.display(methods(Main.forward))
+                error("Stopping due to missing MaxPool1DLayer forward method during dispatch check.")
+            end
+            current_var = Main.forward(layer_item, current_var)
         else
+            # Fallback to generic dispatch for other layers (from  itself)
+            # This should find methods like forward(::Dense, ...)
+            #println("Dispatching with invokelatest for layer type: $(typeof(layer_item))")
             current_var = Base.invokelatest(forward, layer_item, current_var)
         end
     end
+    #println("--- MLPModel Forward Pass END ---")
     return current_var
 end
 (model::MLPModel)(x_var::Variable) = forward(model, x_var)
-
 function get_params(model::MLPModel)
     all_params = Variable[]
     for layer_item in model.layers
@@ -506,23 +593,21 @@ function get_params(model::MLPModel)
     end
     return unique(all_params)
 end
-
 function train_mode!(model::MLPModel)
     model.is_training_ref[] = true
-    for l_item in model.layers
+    for l_item in model.layers # changed l to l_item
         if l_item isa DropoutLayer
             l_item.is_training[] = true
         end
     end
 end
-
 function eval_mode!(model::MLPModel)
     model.is_training_ref[] = false
-    for l_item in model.layers
+    for l_item in model.layers # changed l to l_item
         if l_item isa DropoutLayer
             l_item.is_training[] = false
         end
     end
 end
 
-end # module NeuralNet
+end # module CNNLayers
