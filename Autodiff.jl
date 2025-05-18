@@ -77,62 +77,100 @@ end
 Base.show(io::IO, v::Variable) = print(io, "Variable{$(eltype(v.value))}(grad=$(v.gradient !== nothing))")
 
 
+"""
+    accumulate_gradient!(v::Variable{T}, g) where {T<:Real}
+
+Accumulates a (finite) gradient `g` into `v.gradient`, initializing if needed.
+Skips entirely on NaN/Inf inputs.
+"""
 function accumulate_gradient!(v::Variable{T}, g) where {T<:Real}
-    if (isa(g, Real) && !isfinite(g)) || (isa(g, AbstractArray) && !all(isfinite, g))
-        @warn "accumulate_gradient! received NaN/Inf gradient. Skipping accumulation." typeof_v=T size_v=size(v.value) typeof_g=typeof(g)
-        if v.gradient === nothing; v.gradient = zero(v.value); @warn "Initialized gradient to zero due to incoming NaN/Inf."; end
+    # 1) Reject non-finite gradients immediately
+    if isnan_or_inf(g)
+        warn_nan_inf!(v, g)
         return
     end
 
-    g_converted = try
-        if isa(g, AbstractArray)
-            if eltype(g) <: AbstractArray{T, 0}; [el[] for el in g]::AbstractArray{T}
-            elseif eltype(g) == T; g
-            else convert(AbstractArray{T}, g)
-            end
-        elseif isa(g, Real); convert(T, g)
-        elseif g === nothing; @warn "..."; return
-        else @warn "..."; g
-        end
-    catch e; @error "Error during gradient conversion in accumulate_gradient!" typeof_v=T typeof_g=typeof(g) size_g=size(g) exception=(e, catch_backtrace()); return; end
-
-    is_large_param = v.is_param && isa(v.value, AbstractMatrix) && size(v.value, 1) * size(v.value, 2) > 10000
-    if is_large_param && rand() < 0.05
-        incoming_norm = g_converted === nothing ? -1.0f0 : norm(g_converted)
-        println("  [accumulate_gradient!] Called for Large Param? Var Shape=$(size(v.value)), Grad Shape=$(size(g_converted)), Incoming Norm=$(round(incoming_norm, sigdigits=4))")
+    # 2) Convert incoming gradient to the right type/shape
+    g2 = try
+        convert_gradient(g, T, size(v.value))
+    catch e
+        @error "Gradient conversion failed" exception=(e, catch_backtrace())
+        return
     end
 
+    # 3) Optional logging for large parameters
+    log_large_param!(v, g2, stage=:converted)
+
+    # 4) Initialize or accumulate
     if v.gradient === nothing
-        if isa(v.value, AbstractArray)
-            v.gradient = isa(g_converted, Real) ? fill(g_converted, size(value(v))) : deepcopy(g_converted)
-            if size(v.gradient) != size(v.value) && !isa(g_converted, Real); @error "Shape mismatch init copy!" size_v=size(v.value) size_g=size(g_converted); end
-        elseif isa(v.value, Real) && isa(g_converted, Real)
-            v.gradient = T(g_converted) # Directly assign scalar
-        else
-             @error "Inconsistent types/shapes during gradient initialization!" typeof_v=typeof(v.value) typeof_g=typeof(g_converted)
-             v.gradient = deepcopy(g_converted) # Attempt copy
-        end
-        if is_large_param && rand() < 0.05
-             init_grad_norm = v.gradient === nothing ? -1.0f0 : norm(v.gradient)
-            #  println("  [accumulate_gradient!] Initialized Large Param grad. Norm: $(round(init_grad_norm, sigdigits=4))")
-        end
+        init_gradient!(v, g2)
+        log_large_param!(v, g2, stage=:initialized)
     else
         try
-            if size(v.gradient) == size(g_converted)
-                v.gradient .+= g_converted
-            elseif isa(v.gradient, AbstractArray) && isa(g_converted, Real)
-                v.gradient .+= g_converted # Broadcast scalar update
-            elseif isa(v.gradient, Real) && isa(g_converted, AbstractArray)
-                v.gradient += sum(g_converted) # Sum array update to scalar grad
-            else
-                v.gradient .+= g_converted # Try broadcast add
-            end
-             if is_large_param && rand() < 0.05
-                 accum_grad_norm = v.gradient === nothing ? -1.0f0 : norm(v.gradient)
-            end
+            accumulate_into!(v, g2)
+            log_large_param!(v, g2, stage=:accumulated)
         catch e
-            @warn "Gradient accumulation failed (shapes?)" size_grad=size(v.gradient) size_update=size(g_converted) exception=(e, Base.catch_backtrace())
+            @warn "Gradient accumulation failed" exception=(e, catch_backtrace())
         end
+    end
+end
+
+# — Helpers — #
+
+# Check for NaN/Inf in scalars or arrays
+isnan_or_inf(g) = g === nothing ||
+                  (isa(g, Real) && !isfinite(g)) ||
+                  (isa(g, AbstractArray) && !all(isfinite, g))
+
+function warn_nan_inf!(v, g)
+    @warn "Skipping NaN/Inf gradient" var_type=eltype(v.value) grad_type=typeof(g)
+    if v.gradient === nothing
+        v.gradient = zero(v.value)
+        @warn "Initialized gradient to zero because first incoming was NaN/Inf."
+    end
+end
+
+# Convert g into Array{T} or scalar T matching v
+function convert_gradient(g, ::Type{T}, target_size) where {T}
+    if g === nothing
+        error("Unexpected `nothing` gradient after NaN/Inf check")
+    elseif isa(g, AbstractArray)
+        # If it's already the right element type, trust it; else convert
+        return eltype(g) === T ? g : convert(Array{T}, g)
+    else
+        # Scalar case
+        return convert(T, g)
+    end
+end
+
+# Initialize v.gradient from the first gradient g2
+function init_gradient!(v::Variable{T}, g2) where {T}
+    if isa(v.value, AbstractArray)
+        v.gradient = isa(g2, Real) ? fill(g2, size(v.value)) : deepcopy(g2)
+    else
+        v.gradient = isa(g2, Real) ? g2 : sum(g2)
+    end
+end
+
+# Do the in-place accumulation
+function accumulate_into!(v::Variable{T}, g2) where {T}
+    if isa(v.gradient, AbstractArray) && isa(g2, AbstractArray) && size(v.gradient)==size(g2)
+        @. v.gradient += g2
+    elseif isa(v.gradient, AbstractArray) && isa(g2, Real)
+        @. v.gradient += g2
+    elseif isa(v.gradient, Real) && isa(g2, AbstractArray)
+        v.gradient += sum(g2)
+    else
+        # fallback broadcast
+        v.gradient .+= g2
+    end
+end
+
+# Log occasional diagnostics for very large parameters
+function log_large_param!(v, g2; stage::Symbol)
+    if v.is_param && isa(v.value, AbstractMatrix) && prod(size(v.value)) > 10_000 && rand() < 0.05
+        norm_val = isa(g2, AbstractArray) ? norm(g2) : abs(g2)
+        println(" [dbg:$stage] size=$(size(v.value)), grad_norm=$(round(norm_val, sigdigits=4))")
     end
 end
 
